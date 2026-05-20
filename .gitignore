@@ -1,0 +1,31 @@
+# Training data (large, managed separately)
+data/
+
+# Runtime outputs
+checkpoints/
+logs/
+wandb/
+output/
+*.log
+
+# Model weights
+models/
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Misc
+.DS_Store
+*.swp
+.env

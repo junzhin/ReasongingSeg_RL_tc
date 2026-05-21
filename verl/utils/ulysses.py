@@ -296,3 +296,12 @@ def ulysses_pad_and_slice_inputs(
     # we don't need to slice position ids
     input_ids_rmpad = slice_input_tensor(input_ids_rmpad, dim=1, padding=False)
     return input_ids_rmpad, position_ids_rmpad, pad_size
+
+
+def validate_ulysses_config(num_heads: int, sp_size: int) -> None:
+    if sp_size <= 1:
+        return
+    assert num_heads % sp_size == 0, (
+        f"Ulysses sequence parallelism requires num_heads ({num_heads}) "
+        f"to be divisible by sp_size ({sp_size})."
+    )

@@ -17,9 +17,13 @@ Contain small python utility functions
 
 import importlib.metadata
 import importlib.util
+import multiprocessing
+import os
+import queue
 import re
+import signal
 from contextlib import contextmanager
-from functools import lru_cache
+from functools import lru_cache, wraps
 from typing import Any, Dict, List, Union
 
 import numpy as np
@@ -125,3 +129,62 @@ def timer(name: str, timing_raw: Dict[str, float]):
         yield
 
     timing_raw[name] = timer.last
+
+
+def _mp_target_wrapper(target_func, mp_queue, args, kwargs):
+    try:
+        result = target_func(*args, **kwargs)
+        mp_queue.put((True, result))
+    except Exception as e:
+        mp_queue.put((False, e))
+
+
+def timeout_limit(seconds: float, use_signals: bool = False):
+    def decorator(func):
+        @wraps(func)
+        def wrapper_mp(*args, **kwargs):
+            q = multiprocessing.Queue(maxsize=1)
+            process = multiprocessing.Process(target=_mp_target_wrapper, args=(func, q, args, kwargs))
+            process.start()
+            process.join(timeout=seconds)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=0.5)
+                raise TimeoutError(f"Function {func.__name__} timed out after {seconds} seconds")
+            try:
+                success, result_or_exc = q.get(timeout=0.1)
+                if success:
+                    return result_or_exc
+                else:
+                    raise result_or_exc
+            except queue.Empty as err:
+                raise TimeoutError(f"Function {func.__name__} timed out") from err
+            finally:
+                q.close()
+                q.join_thread()
+        return wrapper_mp
+    return decorator
+
+
+def convert_nested_value_to_list_recursive(data_item):
+    import numpy as np
+    if isinstance(data_item, dict):
+        return {k: convert_nested_value_to_list_recursive(v) for k, v in data_item.items()}
+    elif isinstance(data_item, list):
+        return [convert_nested_value_to_list_recursive(elem) for elem in data_item]
+    elif isinstance(data_item, np.ndarray):
+        return convert_nested_value_to_list_recursive(data_item.tolist())
+    else:
+        return data_item
+
+
+def list_of_dict_to_dict_of_list(list_of_dict: list):
+    if len(list_of_dict) == 0:
+        return {}
+    keys = list_of_dict[0].keys()
+    output = {key: [] for key in keys}
+    for data in list_of_dict:
+        for key, item in data.items():
+            assert key in output, f"Key '{key}' not in first dict keys."
+            output[key].append(item)
+    return output

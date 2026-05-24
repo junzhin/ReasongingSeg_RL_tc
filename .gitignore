@@ -6,6 +6,8 @@ checkpoints/
 logs/
 wandb/
 output/
+tensorboard_log/
+verl_0/
 *.log
 
 # Model weights

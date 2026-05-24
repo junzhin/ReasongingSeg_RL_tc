@@ -133,21 +133,6 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: KLController, kl_penalty="kl"):
     kl_ctrl.update(current_kl=current_kl, n_steps=batch_size)
     return data, metrics
 
-# ──────────────────────────────────────────────────────────────────────────────
-# PAPO 感知 KL（kl_prcp / contrastive KL）注入
-#
-# 【核心思想】
-# PAPO 想让模型对"原图"和"随机遮掩图"的输出分布尽量一致——
-# 若模型真正理解图像语义，遮掉部分 patch 不应大幅改变它的回答分布；
-# 若模型靠局部捷径作答，遮掩会让分布剧烈漂移。把这个漂移（KL 散度）
-# 当作惩罚加进 reward，就能逼模型学整体语义、抗遮掩。
-#
-# 【实现方式】
-# 用 old_log_probs（原图前向）和 aug_log_probs（遮掩图前向，由 papo_utils
-# 的 random_patch_blackening 生成）算逐 token KL，乘 response_mask 后
-# 按系数 kl_coef 累加到 token_level_rewards 上。系数可随训练步数 annealing。
-# GRPO baseline 不调用此函数（仅在 use_kl_prcp=true 时启用）。
-# ──────────────────────────────────────────────────────────────────────────────
 def apply_kl_contrastive(
     data: DataProto,
     kl_ctrl_contrastive: core_algos.KLController,
@@ -157,16 +142,14 @@ def apply_kl_contrastive(
     # not used in GRPO
     batch_size = data.batch.batch_size[0]
     response_mask = data.batch["response_mask"]
-
+    
     if kl_prcp_apply_mode == "correct_only":
         raise NotImplementedError("correct_only mode is not implemented yet.")
 
-    # 原图 log_prob vs 遮掩图 log_prob 的逐 token KL 散度 = 感知漂移量
     kld_contrastive = core_algos.compute_kl(
         data.batch["old_log_probs"], data.batch["aug_log_probs"], kl_penalty=kl_penalty_contrastive
     )
     kld_contrastive = kld_contrastive * response_mask
-    # 把感知 KL 按系数加进 token_level_rewards：漂移越大，惩罚越大
     if "token_level_rewards" in data.batch:
         current_rewards = data.batch["token_level_rewards"]
         updated_rewards = current_rewards + kl_ctrl_contrastive.kl_coef * kld_contrastive
@@ -188,10 +171,6 @@ def apply_kl_contrastive(
     return data, metrics
 
 def compute_advantage(data: DataProto, adv_estimator: AdvantageEstimator, gamma: float = 1.0, lam: float = 1.0):
-    # advantage 分发器：按 adv_estimator 选择 core_algos.py 里对应的估计器。
-    # 注意：感知 KL（PAPO）已在 apply_kl_contrastive 中累加进 token_level_rewards，
-    # 所以这里各估计器拿到的 reward 已经包含了感知惩罚，无需特殊处理。
-    # uid 即每个回答所属 prompt 的 index，用于 GRPO/DAPO/RLOO 的组内归一化。
     token_level_rewards = data.batch["token_level_rewards"]
     response_mask = data.batch["response_mask"]
     index = data.non_tensor_batch["uid"]
@@ -494,57 +473,56 @@ class RayPPOTrainer:
         self.logger.log_generation(samples, self.global_step)
 
     def _validate(self) -> Dict[str, Any]:
-        # 验证流程：跑验证集生成回答 → 打分 → 汇总平均 reward。不更新参数，纯评估。
-        reward_tensor_lst = []  # 收集每个验证 batch 的 reward 张量
+        reward_tensor_lst = []
         # Lists to collect samples for the table
-        sample_inputs, sample_outputs, sample_labels, sample_scores = [], [], [], []  # 收集样本（输入/输出/标签/分数），用于日志展示表格
-        reward_metrics_lst = defaultdict(list)  # 收集各项打分指标（accuracy 等），按 key 累积
-        print("Start validation...")  # 提示开始验证
-        self.actor_rollout_ref_wg.prepare_rollout_engine()  # 同步 actor 权重到 vLLM，准备生成
-        for batch_dict in self.val_dataloader:  # 遍历验证集每个 batch
-            test_batch = DataProto.from_single_dict(batch_dict)  # 原始 dict → DataProto 结构
-            test_gen_batch = test_batch.pop(  # 抽出生成所需字段，单独组成生成输入
-                batch_keys=["input_ids", "attention_mask", "position_ids"],  # 张量字段：token、注意力掩码、位置编码
-                non_tensor_batch_keys=["raw_prompt_ids", "multi_modal_data"],  # 非张量字段：原始 prompt、图像等多模态数据
+        sample_inputs, sample_outputs, sample_labels, sample_scores = [], [], [], []
+        reward_metrics_lst = defaultdict(list)
+        print("Start validation...")
+        self.actor_rollout_ref_wg.prepare_rollout_engine()
+        for batch_dict in self.val_dataloader:
+            test_batch = DataProto.from_single_dict(batch_dict)
+            test_gen_batch = test_batch.pop(
+                batch_keys=["input_ids", "attention_mask", "position_ids"],
+                non_tensor_batch_keys=["raw_prompt_ids", "multi_modal_data"],
             )
-            repeat_times = self.config.worker.rollout.val_override_config.get("n", 1)  # 验证时每个 prompt 生成几个回答（默认 1）
-            test_gen_batch.meta_info = self.config.worker.rollout.val_override_config  # 用验证专用的生成配置覆盖（如 temperature）
-            test_gen_batch.meta_info["min_pixels"] = self.config.data.min_pixels  # 图像最小像素约束
-            test_gen_batch.meta_info["max_pixels"] = self.config.data.max_pixels  # 图像最大像素约束
-            test_gen_batch.meta_info["video_fps"] = self.config.data.video_fps  # 视频帧率（若有视频输入）
+            repeat_times = self.config.worker.rollout.val_override_config.get("n", 1)
+            test_gen_batch.meta_info = self.config.worker.rollout.val_override_config
+            test_gen_batch.meta_info["min_pixels"] = self.config.data.min_pixels
+            test_gen_batch.meta_info["max_pixels"] = self.config.data.max_pixels
+            test_gen_batch.meta_info["video_fps"] = self.config.data.video_fps
 
-            test_gen_batch, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_ref_wg.world_size)  # 补 pad 使 batch 能被 GPU 数整除（分布式均分）
-            test_output_gen_batch = self.actor_rollout_ref_wg.generate_sequences(test_gen_batch)  # vLLM 生成回答
-            test_output_gen_batch = unpad_dataproto(test_output_gen_batch, pad_size=pad_size * repeat_times)  # 去掉之前补的 pad（×repeat 因生成翻倍）
+            test_gen_batch, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_ref_wg.world_size)
+            test_output_gen_batch = self.actor_rollout_ref_wg.generate_sequences(test_gen_batch)
+            test_output_gen_batch = unpad_dataproto(test_output_gen_batch, pad_size=pad_size * repeat_times)
 
             # repeat to align with repeated responses in rollout
-            test_batch = test_batch.repeat(repeat_times=repeat_times, interleave=True)  # 原始 batch 也复制 n 份，与多回答对齐
-            test_batch = test_batch.union(test_output_gen_batch)  # 合并生成结果（回答）回 batch
+            test_batch = test_batch.repeat(repeat_times=repeat_times, interleave=True)
+            test_batch = test_batch.union(test_output_gen_batch)
 
             # evaluate using reward_function
-            reward_tensor, reward_metrics = ray.get(self.val_reward_fn.compute_reward.remote(test_batch))  # 对回答打分（与训练同一套 reward_fn）
+            reward_tensor, reward_metrics = ray.get(self.val_reward_fn.compute_reward.remote(test_batch))
 
             # store generations
-            input_ids = test_batch.batch["prompts"]  # 取 prompt token id
-            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]  # 解码成可读 prompt 文本
-            output_ids = test_batch.batch["responses"]  # 取回答 token id
-            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]  # 解码成可读回答文本
-            scores = reward_tensor.sum(-1).cpu().tolist()  # 每条回答的标量分（token 维求和）
-            sample_inputs.extend(input_texts)  # 累积输入文本
-            sample_outputs.extend(output_texts)  # 累积输出文本
-            sample_labels.extend(test_batch.non_tensor_batch["ground_truth"].tolist())  # 累积标准答案
-            sample_scores.extend(scores)  # 累积分数
+            input_ids = test_batch.batch["prompts"]
+            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+            output_ids = test_batch.batch["responses"]
+            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+            scores = reward_tensor.sum(-1).cpu().tolist()
+            sample_inputs.extend(input_texts)
+            sample_outputs.extend(output_texts)
+            sample_labels.extend(test_batch.non_tensor_batch["ground_truth"].tolist())
+            sample_scores.extend(scores)
 
-            reward_tensor_lst.append(reward_tensor)  # 缓存本 batch reward 张量
-            for key, value in reward_metrics.items():  # 遍历本 batch 各项指标
-                reward_metrics_lst[key].extend(value)  # 按 key 累积到全局列表
+            reward_tensor_lst.append(reward_tensor)
+            for key, value in reward_metrics.items():
+                reward_metrics_lst[key].extend(value)
 
-        self.actor_rollout_ref_wg.release_rollout_engine()  # 验证完释放 vLLM 显存
-        self._maybe_log_val_generations(sample_inputs, sample_outputs, sample_labels, sample_scores)  # 按需把样本生成结果记录到日志（表格）
-        self.val_reward_score = torch.cat(reward_tensor_lst, dim=0).sum(-1).mean().item()  # 全验证集平均 reward（核心指标）
-        val_reward_metrics = {f"val/{key}_reward": value for key, value in reduce_metrics(reward_metrics_lst).items()}  # 聚合各项指标，加 val/ 前缀
-        print("Finish validation.")  # 提示验证结束
-        return {"val/reward_score": self.val_reward_score, **val_reward_metrics}  # 返回总分 + 各项指标
+        self.actor_rollout_ref_wg.release_rollout_engine()
+        self._maybe_log_val_generations(sample_inputs, sample_outputs, sample_labels, sample_scores)
+        self.val_reward_score = torch.cat(reward_tensor_lst, dim=0).sum(-1).mean().item()
+        val_reward_metrics = {f"val/{key}_reward": value for key, value in reduce_metrics(reward_metrics_lst).items()}
+        print("Finish validation.")
+        return {"val/reward_score": self.val_reward_score, **val_reward_metrics}
 
     def _balance_batch(self, batch: DataProto, metrics: Dict[str, Any], logging_prefix: str = "global_seqlen") -> None:
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
@@ -563,15 +541,17 @@ class RayPPOTrainer:
         )
         metrics.update(global_balance_stats)
 
-    def _aug_img_for_kl_prcp(self, original_images_pil: List[Image.Image]) -> List[Image.Image]:
+    def _aug_img_for_kl_prcp(self, original_images_pil: List) -> List[Image.Image]:
         """
         Perform augmentation on the original images for contrastive KL.
-        This function should be implemented based on the specific augmentation method used.
+        multi_modal_data["images"] stores raw file paths (not PIL), so load on demand.
         """
         aug_config = self.config.algorithm.aug_config
         if self.config.algorithm.contrastive_type == "augmented":
             augmented_images = []
             for img in original_images_pil:
+                if isinstance(img, str):
+                    img = Image.open(img).convert("RGB")
                 aug_img = random_patch_blackening(img, **aug_config)
                 augmented_images.append(aug_img)
             return augmented_images
@@ -601,18 +581,6 @@ class RayPPOTrainer:
         self.kl_ctrl_contrastive.update(current_kl=None, n_steps=1)
         return batch
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # 训练 Step 第一阶段：生成有效 Batch
-    #
-    # 【为什么需要一个 while 循环？】
-    # DAPO 的在线过滤（online_filtering）会丢弃"全对/全错"的样本组。
-    # 过滤后剩余样本数可能不足 rollout_batch_size，需要继续从数据集取数据补充。
-    # 这个循环持续生成，直到积累了足够多的有效样本。
-    #
-    # 【PAPO 的图像增强在这里发生】
-    # 如果开启了 use_kl_prcp，在这里对每个样本的原图生成遮掩版本，
-    # 随 batch 一起传给后续的 compute_log_probs_aug()。
-    # ──────────────────────────────────────────────────────────────────────────
     def _make_batch_data(self, metrics: Dict[str, Any]) -> DataProto:
         batch = None
         all_metrics = defaultdict(list)
@@ -623,7 +591,6 @@ class RayPPOTrainer:
             try:
                 batch_dict = next(self.data_iterator)
             except StopIteration:
-                # 数据集遍历完一轮，从头开始（epoch 继续）
                 self.data_iterator = iter(self.train_dataloader)
                 batch_dict = next(self.data_iterator)
 
@@ -633,40 +600,32 @@ class RayPPOTrainer:
                 "video_fps": self.config.data.video_fps,
             }
             new_batch: DataProto = DataProto.from_single_dict(batch_dict, meta_info=meta_info)
-
-            # 【PAPO 感知增强】：为每张图生成遮掩版本，供后续 KL 对比使用
-            # 遮掩在这里提前生成，而不是在 actor 那边，原因：
-            # 遮掩操作是 CPU 上的 PIL 图像处理，在数据准备阶段做比在 GPU worker 上做更高效
+            
             if self.config.algorithm.use_kl_prcp and "multi_modal_data" in new_batch.non_tensor_batch.keys():
                 # take the raw PIL images
                 aug_multi_modal_data = []
                 for item in new_batch.non_tensor_batch["multi_modal_data"]:
                     if "image_aug" in item:
-                        # 离线预增强：数据集中已提前存好了遮掩图（语义感知遮掩，比随机更精准）
+                        # use pre-augmented images (preprocessed for semantic-aware masking)
                         aug_images_pil = item.pop('image_aug')  # a list
-                    else:
-                        # 在线随机遮掩：实时生成（papo_utils.random_patch_blackening）
+                    else: # online random masking
                         original_images_pil = item['images'] # a list
                         aug_images_pil = self._aug_img_for_kl_prcp(original_images_pil)
                     aug_multi_modal_data.append({"images": aug_images_pil})
-                # 遮掩图和原图一起进入 batch，后续 compute_log_probs_aug() 会用到遮掩图
+                # add to new_batch
                 new_batch.non_tensor_batch["aug_multi_modal_data"] = aug_multi_modal_data
-
-            # 分离"用于生成的字段"：只把 prompt token 发给 vLLM rollout worker
-            # 其他字段（如 answer、aug_multi_modal_data）先保留在 new_batch，生成结束后合并
+                
+            # pop those keys for generation
             gen_batch = new_batch.pop(
                 batch_keys=["input_ids", "attention_mask", "position_ids"],
                 non_tensor_batch_keys=["raw_prompt_ids", "multi_modal_data"],
                 meta_info_keys=["min_pixels", "max_pixels", "video_fps"],
             )
 
-            # 调用 vLLM rollout worker，对每个 prompt 生成 n 个回答
-            # generate_sequences 是 Ray remote call，在 rollout worker 上异步执行
+            # generate a batch
             gen_batch_output = self.actor_rollout_ref_wg.generate_sequences(gen_batch)
 
             if self.config.algorithm.adv_estimator == "remax":
-                # REMAX 算法需要一个贪心解码的基线（temperature=0），用于计算相对优势
-                # 本项目用 GRPO/DAPO，这段可以忽略
                 gen_baseline_batch = deepcopy(gen_batch)
                 gen_baseline_batch.meta_info["temperature"] = 0
                 gen_baseline_batch.meta_info["n"] = 1
@@ -680,29 +639,26 @@ class RayPPOTrainer:
                 RayPPOTrainer.safe_set_tensordict(new_batch.batch, "reward_baselines", reward_baseline_tensor)
                 del gen_baseline_batch, gen_baseline_output
 
-            # 给每个 prompt 分配唯一 ID，用于后续 DAPO 过滤时按组聚合
             new_batch.non_tensor_batch["uid"] = np.array(
                 [str(uuid.uuid4()) for _ in range(len(new_batch.batch))], dtype=object
             )
-            # 把 prompt 数据复制 n 份（对齐 n 个生成回答），再与生成结果合并
-            # 这样 batch 中每条数据 = (prompt + 第i个回答)，共 batch_size × n 条
+            # repeat to align with repeated responses in rollout
             new_batch = new_batch.repeat(repeat_times=self.config.worker.rollout.n, interleave=True)
             new_batch = new_batch.union(gen_batch_output)
 
-            # 【DAPO 在线过滤】：丢弃"全对/全错"的样本组，只保留有学习信号的组
+            # filter group
             if self.config.algorithm.online_filtering:
                 reward_tensor, reward_metrics = ray.get(self.reward_fn.compute_reward.remote(new_batch))
                 RayPPOTrainer.safe_set_tensordict(new_batch.batch, "token_level_scores", reward_tensor)
                 for k, v in reward_metrics.items():
                     all_metrics[k].extend(v)
-                filter_scores = reward_metrics[self.config.algorithm.filter_key]  # 用 overall 字段
+                filter_scores = reward_metrics[self.config.algorithm.filter_key]
                 assert len(filter_scores) != 0, "Filter scores should not be empty."
                 uids = new_batch.non_tensor_batch["uid"]
                 uid2scores = defaultdict(list)
                 for uid, score in zip(uids, filter_scores):
                     uid2scores[uid].append(score)
 
-                # 计算每组的平均分，过滤掉全对（>0.99）和全错（<0.01）的组
                 uid2mean = {uid: np.mean(scores) for uid, scores in uid2scores.items()}
                 kept_uids = [
                     uid
@@ -711,11 +667,9 @@ class RayPPOTrainer:
                 ]
                 kept_sample_idxs = [idx for idx, uid in enumerate(uids) if uid in kept_uids]
                 if len(kept_sample_idxs) == 0:
-                    # 极端情况：所有组都被过滤了，保留全部（避免空 batch）
                     kept_sample_idxs = list(range(len(uids)))
                 new_batch = new_batch[kept_sample_idxs]
 
-            # 累积有效样本，直到达到 rollout_batch_size
             batch = DataProto.concat([batch, new_batch]) if batch is not None else new_batch
             current_batch_size = len(batch) // self.config.worker.rollout.n
             rollout_batch_size = self.config.data.rollout_batch_size
@@ -735,228 +689,174 @@ class RayPPOTrainer:
                 print(f"{current_batch_size=} >= {rollout_batch_size=}. Finish generating.")
                 if self.config.algorithm.online_filtering:
                     metrics.update({f"reward/{k}": v for k, v in reduce_metrics(all_metrics).items()})
-                # 截取精确的 rollout_batch_size 数量返回（多余的丢弃）
+
                 return batch[: self.config.data.rollout_batch_size * self.config.worker.rollout.n]
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # 主训练循环：fit()
-    #
-    # 【整体流程图（每个 step）】
-    #
-    #  ┌─ 阶段1：生成（gen）─────────────────────────────────────┐
-    #  │  _make_batch_data()                                      │
-    #  │  → vLLM rollout：每个 prompt 生成 n 个回答              │
-    #  │  → [DAPO] 过滤全对/全错的组                             │
-    #  │  → [PAPO] 生成遮掩图版本                                │
-    #  └──────────────────────────────────────────────────────────┘
-    #           ↓
-    #  ┌─ 阶段2：打分（reward）──────────────────────────────────┐
-    #  │  reward_fn.compute_reward()                              │
-    #  │  → medical_evidence.py:compute_score()                  │
-    #  │  → 得到每个回答的 overall 分（用于 advantage 计算）     │
-    #  └──────────────────────────────────────────────────────────┘
-    #           ↓
-    #  ┌─ 阶段3：计算 log_prob ──────────────────────────────────┐
-    #  │  compute_log_probs()：当前策略对生成文本的对数概率       │
-    #  │  [PAPO] compute_log_probs_aug()：遮掩图的对数概率        │
-    #  │  [可选] compute_ref_log_probs()：参考策略的对数概率      │
-    #  └──────────────────────────────────────────────────────────┘
-    #           ↓
-    #  ┌─ 阶段4：计算 advantage（adv）──────────────────────────┐
-    #  │  compute_advantage()：调用 core_algos.py 中的           │
-    #  │  compute_grpo/dapo_outcome_advantage()                   │
-    #  │  → 组内归一化 reward → advantage                        │
-    #  └──────────────────────────────────────────────────────────┘
-    #           ↓
-    #  ┌─ 阶段5：更新参数（update_actor）───────────────────────┐
-    #  │  actor_rollout_ref_wg.update_actor()                     │
-    #  │  → PPO clip loss + KL loss + [PAPO] kl_prcp loss         │
-    #  │  → FSDP 反向传播，梯度同步，参数更新                   │
-    #  └──────────────────────────────────────────────────────────┘
-    #
-    # 【driver 进程 vs worker 进程】
-    # fit() 运行在 driver 进程（主进程），所有实际计算通过 Ray RPC 分发给 worker。
-    # driver 本身只做轻量逻辑：数据调度、advantage 计算、日志记录。
-    # ──────────────────────────────────────────────────────────────────────────
     def fit(self):
         """
         The training loop of PPO.
         The driver process only need to call the compute functions of the worker group through RPC to construct the PPO dataflow.
         The light-weight advantage computation is done on the driver process.
         """
-        self.logger = Tracker(loggers=self.config.trainer.logger, config=self.config.to_dict())  # 初始化日志记录器（wandb/tensorboard 等）
-        self.global_step = 0  # 全局训练步计数器，从 0 开始
-        main_tqdm = tqdm(range(self.training_steps), desc="Running step", position=0)  # 进度条
-        val_metrics: Optional[Dict[str, Any]] = None  # 验证指标缓存，初始为空
+        self.logger = Tracker(loggers=self.config.trainer.logger, config=self.config.to_dict())
+        self.global_step = 0
+        main_tqdm = tqdm(range(self.training_steps), desc="Running step", position=0)
+        val_metrics: Optional[Dict[str, Any]] = None
 
         # load checkpoint before doing anything
-        self._load_checkpoint()  # 断点续训：若有 checkpoint，恢复模型/优化器/step
-        main_tqdm.update(self.global_step)  # 进度条同步到恢复后的 step
+        self._load_checkpoint()
+        main_tqdm.update(self.global_step)
 
-        # 训练前先做一次验证，记录初始性能基准（便于判断训练是否在提升）
-        if self.val_reward_fn is not None and self.config.trainer.val_before_train:  # 有验证函数且配置要求训练前验证
-            val_metrics = self._validate()  # 跑一遍验证集，得到初始指标
-            self.logger.log(data=val_metrics, step=self.global_step)  # 记录到日志
-            if self.config.trainer.val_only:  # 若只验证不训练（val_only 模式）
-                return  # 直接退出
+        # perform validation before training
+        if self.val_reward_fn is not None and self.config.trainer.val_before_train:
+            val_metrics = self._validate()
+            self.logger.log(data=val_metrics, step=self.global_step)
+            if self.config.trainer.val_only:
+                return
 
-        self.data_iterator = iter(self.train_dataloader)  # 构造训练数据迭代器
-        while self.global_step < self.training_steps:  # 主训练循环：直到达到总步数
-            self.global_step += 1  # 步数自增
+        self.data_iterator = iter(self.train_dataloader)
+        while self.global_step < self.training_steps:
+            self.global_step += 1
 
-            metrics, timing_raw = {}, {}  # 本步的指标字典 + 计时字典
-            with timer("step", timing_raw):  # 给整个 step 计时
-                # ── 阶段1：生成 ──────────────────────────────────────────
-                # prepare_rollout_engine()：把 FSDP actor 权重同步给 vLLM rollout worker
-                # 每次 actor 更新后，rollout worker 需要拿到最新权重才能生成"当前策略"的回答
-                with timer("gen", timing_raw):  # 给生成阶段计时
-                    self.actor_rollout_ref_wg.prepare_rollout_engine()  # 把最新 actor 权重同步给 vLLM rollout 引擎
-                    batch = self._make_batch_data(metrics=metrics)  # vLLM 生成回答，组成训练 batch（DAPO 模式下还含过滤+打分）
-                    # 生成完成后释放 vLLM 显存，让 actor 更新阶段有足够显存
-                    self.actor_rollout_ref_wg.release_rollout_engine()  # 卸载 vLLM，回收显存
+            metrics, timing_raw = {}, {}
+            with timer("step", timing_raw):
+                # make a batch of data
+                with timer("gen", timing_raw):
+                    self.actor_rollout_ref_wg.prepare_rollout_engine()
+                    batch = self._make_batch_data(metrics=metrics)
+                    self.actor_rollout_ref_wg.release_rollout_engine()
 
-                # 各 GPU 卡的有效 token 数可能差异很大（不同长度的序列）
-                # 重新排序 batch，使每张卡分到的 token 总量尽量均衡，提高 GPU 利用率
-                # 注意：reorder 后组内的相对顺序会被打乱，
-                #       但 GRPO advantage 计算用 uid 分组，不依赖绝对顺序，所以安全
-                self._balance_batch(batch, metrics=metrics)  # 跨卡负载均衡：按 token 数重排序
+                # balance the number of valid tokens on each dp rank.
+                # NOTE: this breaks the order of data inside the batch.
+                # Please take care when you implement group based adv computation such as GRPO and rloo
+                self._balance_batch(batch, metrics=metrics)
 
                 # compute global valid tokens
-                batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()  # 统计每条序列的有效 token 数，存入 meta（后续吞吐量/loss 归一化用）
+                batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
-                # ── 阶段2：打分 ──────────────────────────────────────────
-                # online_filtering=True 时，_make_batch_data 里已经打过分了（存在 token_level_scores）
-                # 否则这里打分（非 DAPO 模式）
-                reward_metrics = None  # 打分指标缓存，None 表示本步还没打过分
-                if "token_level_scores" not in batch.batch:  # batch 里还没有分数（非 DAPO 在线过滤模式）
-                    with timer("reward", timing_raw):  # 给打分计时
-                        reward_ref = self.reward_fn.compute_reward.remote(batch)  # 异步 RPC：reward worker 对回答文本打分
-                        reward_tensor, reward_metrics = ray.get(reward_ref)  # 阻塞取回打分结果（标量分 + accuracy 等指标）
+                reward_metrics = None
+                # compute reward
+                if "token_level_scores" not in batch.batch:
+                    with timer("reward", timing_raw):
+                        reward_ref = self.reward_fn.compute_reward.remote(batch)
+                        reward_tensor, reward_metrics = ray.get(reward_ref)
 
-                # 【PAPO 专用】：把每个样本的 kl_prcp 权重和系数注入 batch
-                # 这些值在 actor update 阶段用于调整 kl_prcp 损失的大小
-                if self.config.algorithm.use_kl_prcp:  # 开启了 PAPO 感知 KL
-                    if reward_metrics is None:  # 守卫：若上面没打过分（DAPO 已打则跳过），这里补打一次
+                if self.config.algorithm.use_kl_prcp:
+                    if reward_metrics is None:
                         reward_ref = self.reward_fn.compute_reward.remote(batch)
                         reward_tensor, reward_metrics = ray.get(reward_ref)
 
                     # store acc reward in batch
-                    batch = self._get_kl_prcp_weights(batch, reward_metrics)  # 计算每条样本的 kl_prcp 权重，写入 batch
-                    # store kl_prcp coef in batch（可能随训练步数 annealing）
-                    batch = self._get_kl_prcp_coef(batch)  # 写入当前 kl_prcp 系数（支持 annealing 衰减）
-
-                if self.config.algorithm.use_sft_loss:  # 开启了辅助 SFT 损失
-                    if reward_metrics is None:  # 同样的守卫：确保有打分结果
+                    batch = self._get_kl_prcp_weights(batch, reward_metrics)
+                    # store kl_prcp coef in batch
+                    batch = self._get_kl_prcp_coef(batch)
+                
+                if self.config.algorithm.use_sft_loss:
+                    if reward_metrics is None:
                         reward_ref = self.reward_fn.compute_reward.remote(batch)
                         reward_tensor, reward_metrics = ray.get(reward_ref)
                     # compute correctness mask
-                    batch = self._get_correctness_mult_mask(batch, reward_metrics)  # 按 accuracy 生成正确性掩码（只对正确样本加 SFT 损失）
+                    batch = self._get_correctness_mult_mask(batch, reward_metrics)
 
-                # ── 阶段3：计算 log_prob ─────────────────────────────────
-                # 用当前策略重新计算生成文本的 log_prob（"旧策略" log_prob，用于 PPO clip 比值）
-                # 为什么要"重算"？rollout 时用的是 vLLM 推理，不输出 log_prob；
-                # 现在用 FSDP actor forward 精确计算
-                with timer("old", timing_raw):  # 给 old_log_prob 计算计时
-                    old_log_probs = self.actor_rollout_ref_wg.compute_log_probs(batch)  # actor forward 精确算出生成文本的 log_prob
-                    batch = batch.union(old_log_probs)  # 合并进 batch（作为 PPO clip 比值的分母基准）
+                # recompute old_log_probs
+                with timer("old", timing_raw):
+                    old_log_probs = self.actor_rollout_ref_wg.compute_log_probs(batch)
+                    batch = batch.union(old_log_probs)
 
-                # 【PAPO 专用】：用遮掩图重新做 forward，得到遮掩图的 log_prob
-                # 原图 log_prob 和遮掩图 log_prob 的 KL 散度就是 kl_prcp 损失
-                if self.config.algorithm.use_kl_prcp and "aug_multi_modal_data" in batch.non_tensor_batch.keys():  # 开启 PAPO 且 batch 含遮掩图
-                    with timer("aug_probs", timing_raw):  # 给遮掩图 forward 计时
-                        aug_log_probs = self.actor_rollout_ref_wg.compute_log_probs_aug(batch)  # 用遮掩图做 forward 算 log_prob
-                        batch = batch.union(aug_log_probs)  # 合并进 batch（与原图 log_prob 算感知 KL）
+                # compute aug log_probs
+                if self.config.algorithm.use_kl_prcp and "aug_multi_modal_data" in batch.non_tensor_batch.keys():
+                    # compute log_probs with augmented images
+                    with timer("aug_probs", timing_raw):
+                        aug_log_probs = self.actor_rollout_ref_wg.compute_log_probs_aug(batch)
+                        batch = batch.union(aug_log_probs)
 
-                # 参考策略的 log_prob（用于 KL 惩罚项，disable_kl=true 时不参与 reward）
-                if self.use_reference_policy:  # 启用了参考模型
-                    with timer("ref", timing_raw):  # 给 ref forward 计时
-                        ref_log_probs = self.actor_rollout_ref_wg.compute_ref_log_probs(batch)  # 参考模型 forward 算 log_prob
-                        batch = batch.union(ref_log_probs)  # 合并进 batch（防策略偏离基座的 KL 基准）
+                # compute ref_log_probs
+                if self.use_reference_policy:
+                    with timer("ref", timing_raw):
+                        ref_log_probs = self.actor_rollout_ref_wg.compute_ref_log_probs(batch)
+                        batch = batch.union(ref_log_probs)
 
-                # critic（价值网络）：GRPO/DAPO 不用 critic，这段忽略
-                if self.use_critic:  # 仅 PPO/GAE 模式为 True
-                    with timer("values", timing_raw):  # 给 critic 计时
-                        values = self.critic_wg.compute_values(batch)  # critic forward 估计每个状态的价值 V(s)
-                        batch = batch.union(values)  # 合并进 batch（GAE advantage 的 baseline）
+                # compute values
+                if self.use_critic:
+                    with timer("values", timing_raw):
+                        values = self.critic_wg.compute_values(batch)
+                        batch = batch.union(values)
 
-                # ── 阶段4：计算 advantage ────────────────────────────────
-                with timer("adv", timing_raw):  # 给 advantage 计算计时
-                    if "token_level_scores" not in batch.batch:  # 分数还没落到 batch（之前是异步 remote 调用）
-                        # 异步等待 reward 计算完成（如果之前是 remote call 还没取到结果）
-                        reward_tensor, reward_metrics = ray.get(reward_ref)  # 取回打分结果
-                        RayPPOTrainer.safe_set_tensordict(batch.batch, "token_level_scores", reward_tensor)  # 写入原始分 token_level_scores
-                        reward_metrics = {f"reward/{k}": v for k, v in reduce_metrics(reward_metrics).items()}  # 聚合打分指标，加 reward/ 前缀
-                        metrics.update(reward_metrics)  # 并入本步指标
+                with timer("adv", timing_raw):
+                    if "token_level_scores" not in batch.batch:
+                        # get token level scores asynchronously
+                        reward_tensor, reward_metrics = ray.get(reward_ref)
+                        RayPPOTrainer.safe_set_tensordict(batch.batch, "token_level_scores", reward_tensor)
+                        reward_metrics = {f"reward/{k}": v for k, v in reduce_metrics(reward_metrics).items()}
+                        metrics.update(reward_metrics)
 
-                    # KL 惩罚模式（disable_kl=true 时跳过）：把 KL 散度从 reward 中扣除
-                    if not self.config.algorithm.use_kl_loss and self.use_reference_policy:  # 用"reward 内扣 KL"而非"loss 项 KL"，且有参考模型
-                        batch, kl_metrics = apply_kl_penalty(batch, self.kl_ctrl, self.config.algorithm.kl_penalty)  # 从 token_level_scores 扣 ref KL，得 token_level_rewards
-                        metrics.update(kl_metrics)  # 记录 KL 指标
+                    # apply kl penalty if available
+                    if not self.config.algorithm.use_kl_loss and self.use_reference_policy:
+                        # apply kl penalty to reward
+                        batch, kl_metrics = apply_kl_penalty(batch, self.kl_ctrl, self.config.algorithm.kl_penalty)
+                        metrics.update(kl_metrics)
                     else:
-                        # 不加 KL 惩罚，直接用原始 reward 作为 token-level reward
-                        RayPPOTrainer.safe_set_tensordict(batch.batch, "token_level_rewards", batch.batch["token_level_scores"])  # token_level_rewards = 原始分（不扣 KL）
+                        RayPPOTrainer.safe_set_tensordict(batch.batch, "token_level_rewards", batch.batch["token_level_scores"])
 
-                    # 调用 core_algos.py 中的 GRPO/DAPO advantage 计算
-                    # 这步在 driver 进程上运行（CPU），计算量轻（只是归一化）
-                    batch = compute_advantage(  # 把 reward 转成 advantage（组内归一化或 GAE）
+                    # compute advantages, executed on the driver process
+                    batch = compute_advantage(
                         batch,
-                        adv_estimator=self.config.algorithm.adv_estimator,  # 估计器类型：grpo/dapo/gae 等
-                        gamma=self.config.algorithm.gamma,  # 折扣因子（GRPO/DAPO 不用）
-                        lam=self.config.algorithm.lam,  # GAE 的 lambda（GRPO/DAPO 不用）
+                        adv_estimator=self.config.algorithm.adv_estimator,
+                        gamma=self.config.algorithm.gamma,
+                        lam=self.config.algorithm.lam,
                     )
 
-                # ── 阶段5：更新参数 ──────────────────────────────────────
-                if self.use_critic:  # 有 critic 才更新 critic（GRPO/DAPO 跳过）
-                    with timer("update_critic", timing_raw):  # 给 critic 更新计时
-                        critic_output = self.critic_wg.update_critic(batch)  # RPC：critic worker 做反向传播更新价值网络
+                # update critic
+                if self.use_critic:
+                    with timer("update_critic", timing_raw):
+                        critic_output = self.critic_wg.update_critic(batch)
 
-                    critic_metrics = reduce_metrics(critic_output.non_tensor_batch)  # 聚合多卡 critic 指标
-                    metrics.update(critic_metrics)  # 并入本步指标
+                    critic_metrics = reduce_metrics(critic_output.non_tensor_batch)
+                    metrics.update(critic_metrics)
 
-                # actor update：PPO clip loss + KL loss + [PAPO] kl_prcp loss
-                # 内部用 FSDP 做分布式反向传播，梯度在各卡间 all-reduce 后更新参数
-                if self.config.trainer.critic_warmup <= self.global_step:  # critic 预热期已过才更 actor（GRPO 下 warmup=0，恒成立）
-                    with timer("update_actor", timing_raw):  # 给 actor 更新计时
-                        actor_output = self.actor_rollout_ref_wg.update_actor(batch)  # RPC：actor worker 算 PPO/KL/kl_prcp 损失并反向更新策略（真正的 loss 在此 worker 内部）
+                # update actor
+                if self.config.trainer.critic_warmup <= self.global_step:
+                    with timer("update_actor", timing_raw):
+                        actor_output = self.actor_rollout_ref_wg.update_actor(batch)
 
-                    actor_metrics = reduce_metrics(actor_output.non_tensor_batch)  # 聚合多卡 actor 指标（pg_loss/kl/clipfrac 等）
-                    metrics.update(actor_metrics)  # 并入本步指标
+                    actor_metrics = reduce_metrics(actor_output.non_tensor_batch)
+                    metrics.update(actor_metrics)
 
-                # ── 验证 & 保存 ──────────────────────────────────────────
+                # validate
                 if (
-                    self.val_reward_fn is not None  # 有验证函数
-                    and self.config.trainer.val_freq > 0  # 配置了验证频率
-                    and self.global_step % self.config.trainer.val_freq == 0  # 到达验证步
+                    self.val_reward_fn is not None
+                    and self.config.trainer.val_freq > 0
+                    and self.global_step % self.config.trainer.val_freq == 0
                 ):
-                    with timer("validation", timing_raw):  # 给验证计时
-                        val_metrics = self._validate()  # 跑验证集
+                    with timer("validation", timing_raw):
+                        val_metrics = self._validate()
 
-                    metrics.update(val_metrics)  # 并入本步指标
+                    metrics.update(val_metrics)
 
-                if self.config.trainer.save_freq > 0 and self.global_step % self.config.trainer.save_freq == 0:  # 到达保存步
-                    with timer("save_checkpoint", timing_raw):  # 给存档计时
-                        self._save_checkpoint()  # 保存 checkpoint
+                if self.config.trainer.save_freq > 0 and self.global_step % self.config.trainer.save_freq == 0:
+                    with timer("save_checkpoint", timing_raw):
+                        self._save_checkpoint()
 
             # collect metrics
-            num_gpus = self.resource_pool_manager.get_num_gpus()  # 获取 GPU 总数（算吞吐量用）
-            metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))  # 数据相关指标（reward/advantage 分布等）
-            metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))  # 各阶段耗时指标
-            metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, num_gpus=num_gpus))  # 吞吐量指标（token/s 等）
+            num_gpus = self.resource_pool_manager.get_num_gpus()
+            metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+            metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+            metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, num_gpus=num_gpus))
 
-            self.logger.log(data=metrics, step=self.global_step)  # 把本步所有指标写入日志
-            main_tqdm.update()  # 进度条 +1
-
+            self.logger.log(data=metrics, step=self.global_step)
+            main_tqdm.update()
+        
         # perform validation after training
-        if self.val_reward_fn is not None:  # 训练结束后补一次最终验证
+        if self.val_reward_fn is not None:
             if (
-                val_metrics is None  # 从没验证过
-                or self.config.trainer.val_freq <= 0  # 或没开周期验证
-                or self.global_step % self.config.trainer.val_freq != 0  # 或最后一步不是验证步
+                val_metrics is None
+                or self.config.trainer.val_freq <= 0
+                or self.global_step % self.config.trainer.val_freq != 0
             ):
-                val_metrics = self._validate()  # 补跑验证
-                self.logger.log(data=val_metrics, step=self.global_step)  # 记录
+                val_metrics = self._validate()
+                self.logger.log(data=val_metrics, step=self.global_step)
 
-            print(f"Final validation metrics: {convert_dict_to_str(val_metrics)}")  # 打印最终验证结果
+            print(f"Final validation metrics: {convert_dict_to_str(val_metrics)}")
 
-        if self.config.trainer.save_freq <= 0 or self.global_step % self.config.trainer.save_freq != 0:  # 若最后一步还没存档
-            self._save_checkpoint()  # 补存最终 checkpoint
+        if self.config.trainer.save_freq <= 0 or self.global_step % self.config.trainer.save_freq != 0:
+            self._save_checkpoint()

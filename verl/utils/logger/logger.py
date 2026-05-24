@@ -130,10 +130,7 @@ class WandbLogger(Logger):
         wandb.log(data=data, step=step)
 
     def finish(self) -> None:
-        try:
-            wandb.finish()
-        except Exception as exc:
-            print(f"Warning: wandb.finish() failed: {exc}")
+        wandb.finish()
 
 
 LOGGERS = {

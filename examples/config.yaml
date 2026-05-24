@@ -367,7 +367,7 @@ trainer:
   project_name: easy_r1              # 实验项目名（wandb/tensorboard 中的分组名）
   experiment_name: qwen2_5_3b_math_grpo  # 具体实验名（checkpoint 目录名也用这个）
 
-  logger: ["console", "wandb"]  # 日志后端；集群无 wandb 时改为 ["console", "tensorboard"]
+  logger: ["console", "tensorboard"]  # 日志后端；集群无 wandb 时改为 ["console", "tensorboard"]
 
   nnodes: 1           # 使用几个计算节点（单节点训练用1）
   n_gpus_per_node: 8  # 每个节点的 GPU 数量（本项目集群节点有4张H200）

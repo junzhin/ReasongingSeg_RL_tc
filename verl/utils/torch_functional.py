@@ -16,7 +16,7 @@
 Contain small torch utilities
 """
 
-from typing import Dict, List, Literal, Optional, Tuple, Union
+from typing import List, Literal, Optional, Tuple, Union
 
 import torch
 import torch.distributed
@@ -24,13 +24,6 @@ import torch.nn.functional as F
 from torch.optim.lr_scheduler import LambdaLR
 
 from .torch_dtypes import PrecisionType
-
-try:
-    from tensordict import TensorDict
-    _TENSORDICT_AVAILABLE = True
-except ImportError:
-    _TENSORDICT_AVAILABLE = False
-    TensorDict = None
 
 
 try:
@@ -345,29 +338,3 @@ class AnyPrecisionAdamW(torch.optim.Optimizer):
                     compensation.add_(temp_buffer.sub_(p.data))
                 else:  # usual AdamW updates
                     p.data.addcdiv_(exp_avg, centered_variance, value=-step_size)
-
-
-def allgather_dict_tensors(
-    tensors: "Dict[str, torch.Tensor]",
-    size: int,
-    group,
-    dim: int = 0,
-) -> "Dict[str, torch.Tensor]":
-    if _TENSORDICT_AVAILABLE and TensorDict is not None and isinstance(tensors, TensorDict):
-        is_tensor_dict = True
-        tensors_as_dict = tensors.to_dict()
-    else:
-        tensors_as_dict = tensors
-        is_tensor_dict = False
-
-    output = {}
-    sorted_keys = sorted(tensors_as_dict.keys())
-    for key in sorted_keys:
-        val = tensors_as_dict[key]
-        gathered = [torch.empty_like(val) for _ in range(size)]
-        torch.distributed.all_gather(gathered, val, group=group, async_op=False)
-        output[key] = torch.cat(gathered, dim=dim)
-
-    if is_tensor_dict:
-        output = TensorDict(source=output, batch_size=tensors.batch_size[0] * size)
-    return output

@@ -14,7 +14,11 @@
 # Checkpoints saved to: checkpoints/easy_r1/${EXP_NAME}/
 # ═══════════════════════════════════════════════════════════════════════════
 
-set -euxo pipefail
+# set -euxo pipefail
+
+
+source /inspire/hdd/global_user/hejunjun-24017/junzhin/.bashrc
+conda env list
 
 # ── 1. Locate repo root (auto-detect from script location) ─────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -23,6 +27,8 @@ echo "Repo root: ${REPO_ROOT}"
 cd "${REPO_ROOT}"
 
 # ── 2. Activate conda environment ──────────────────────────────────────
+
+
 ENV_NAME="papo_tc"
 
 # Try common conda locations
@@ -52,31 +58,32 @@ export TOKENIZERS_PARALLELISM=true
 export NCCL_DEBUG=WARN
 export VLLM_LOGGING_LEVEL=WARN
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1
+export RAY_TMPDIR=/tmp/ray_papo_tc
 
 # ── 5. GPU Configuration ─────────────────────────────────────────────
 CUDA_IDS=0,1,2,3
 N_GPU=4
 
 # ── 6. Paths ──────────────────────────────────────────────────────────
-MODEL_PATH=/inspire/hdd/global_user/hejunjun-24017/junzhin/projects/20260519_medsegreasoner_tc/project/qproject-multimedicine/public/share_models/Lingshu-7B
+MODEL_PATH=/inspire/hdd/project/qproject-multimedicine/public/share_models/Lingshu-7B
 
-CONGI_FILE="examples/config.yaml"
+CONFIG_FILE="examples/config.yaml"
 TRAIN_FILE="data/rl_3_evidence_papo_jsonl/train_cepo_lite_80_10_10_papo.jsonl"
 VAL_FILE="data/eval/benchmark_medreasoner_evidence_eval_400_balanced_papo.jsonl"
 FORMAT_PROMPT="examples/format_prompt/math_perception.jinja"
 REWARD_FUNCTION="examples/reward_function/medical_evidence.py:compute_score"
 
 # ── 7. Sanity checks ─────────────────────────────────────────────────
-for f in "${CONGI_FILE}" "${TRAIN_FILE}" "${VAL_FILE}" "${FORMAT_PROMPT}"; do
+for f in "${CONFIG_FILE}" "${TRAIN_FILE}" "${VAL_FILE}" "${FORMAT_PROMPT}"; do
     if [ ! -f "${f}" ]; then
         echo "ERROR: Missing file: ${REPO_ROOT}/${f}"
         exit 1
     fi
 done
 
-if [ ! -d "$(dirname "${MODEL_PATH}")" ]; then
-    echo "WARNING: Model parent dir not found: $(dirname "${MODEL_PATH}")"
-    echo "         Update MODEL_PATH if model is elsewhere."
+if [ ! -d "${MODEL_PATH}" ]; then
+    echo "ERROR: Model dir not found: ${MODEL_PATH}"
+    exit 1
 fi
 
 echo "Train data: $(wc -l < "${TRAIN_FILE}") samples"
@@ -114,9 +121,10 @@ echo "  Save every: ${SAVE_FREQ} steps"
 echo "=========================================="
 echo ""
 
+
 # ── 11. Launch Training ──────────────────────────────────────────────
 CUDA_VISIBLE_DEVICES=${CUDA_IDS} python3 -m verl.trainer.main \
-    config=${CONGI_FILE} \
+    config=${CONFIG_FILE} \
     data.train_files=${TRAIN_FILE} \
     data.val_files=${VAL_FILE} \
     data.rollout_batch_size=${ROLLOUT_BATCH_SIZE} \

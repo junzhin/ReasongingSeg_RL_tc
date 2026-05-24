@@ -1,127 +1,400 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# PAPO 训练主配置文件
+#
+# 所有参数均可通过命令行覆盖，格式为 key=value（OmegaConf 点号语法）。
+# 例如：python -m verl.trainer.main config=examples/config.yaml worker.rollout.n=8
+#
+# 配置分为四大块：data / algorithm / worker / trainer
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 【数据配置】
+# 控制训练数据从哪里读、图像分辨率上下限、每步处理多少样本
+# ──────────────────────────────────────────────────────────────────────────────
 data:
-  train_files: PAPOGalaxy/PAPO_ViRL39K_train
-  val_files: PAPOGalaxy/PAPO_MMK12_test
-  prompt_key: problem
-  answer_key: answer
-  image_key: images
-  video_key: videos
-  image_dir: null
-  video_fps: 2.0
-  max_prompt_length: 4096
-  max_response_length: 2048
-  rollout_batch_size: 512  # equivalent to verl's data.train_batch_size
-  mini_rollout_batch_size: 128  # equivalent to verl's data.gen_batch_size
-  val_batch_size: 1024
-  format_prompt: examples/format_prompt/math_perception.jinja
-  override_chat_template: null
-  shuffle: true
-  seed: 1
-  max_pixels: 1003520 # 1280*28*28
-  min_pixels: 200704 # 256*28*28
-  filter_overlong_prompts: true
+  train_files: PAPOGalaxy/PAPO_ViRL39K_train   # 训练集路径（JSONL格式，每行一个样本）
+  val_files: PAPOGalaxy/PAPO_MMK12_test         # 验证集路径，每隔 val_freq 步评估一次
+  prompt_key: problem    # JSONL 中问题字段名
+  answer_key: answer     # JSONL 中标准答案字段名（用于 reward 计算）
+  image_key: images      # JSONL 中图像路径字段名
+  video_key: videos      # 视频字段名（本项目主要用图像，视频备用）
+  image_dir: null        # 图像根目录前缀，null 表示 JSONL 中路径即完整路径
+  video_fps: 2.0         # 视频帧率（图像任务忽略此项）
 
+  max_prompt_length: 4096      # prompt（问题+图像token）最大长度，超出则截断
+  max_response_length: 2048    # 模型生成回答的最大 token 数
+  rollout_batch_size: 512      # 每步 rollout 的 prompt 数（生成阶段的 batch size）
+  mini_rollout_batch_size: 128 # rollout 内部分 mini-batch 处理，节省显存
+  val_batch_size: 1024         # 验证时的 batch size
+
+  format_prompt: examples/format_prompt/math_perception.jinja  # prompt 格式模板
+  override_chat_template: null  # 覆盖模型默认 chat template（null 表示用模型自带的）
+
+  shuffle: true   # 每 epoch 打乱数据顺序，防止模型记住顺序规律
+  seed: 1         # 随机种子，保证实验可复现
+
+  # 图像分辨率限制：Qwen2.5-VL 用 28×28 像素块作为视觉token单元
+  # max_pixels = 1280×28×28 ≈ 100万像素，约等于 1000×1000 的图像
+  # 超过这个分辨率会自动缩小，避免显存溢出
+  max_pixels: 1003520  # 1280*28*28
+  min_pixels: 200704   # 256*28*28，太小的图像也会被放大到这个尺寸
+
+  filter_overlong_prompts: true  # 过滤掉 prompt 超长的样本，避免训练时报错
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 【算法配置】
+# 控制 RL 算法选择（GRPO/DAPO）以及 PAPO 的感知增强项开关
+# ──────────────────────────────────────────────────────────────────────────────
 algorithm:
-  adv_estimator: dapo
-  disable_kl: true
-  use_kl_loss: true
-  kl_penalty: low_var_kl
-  kl_coef: 1.0e-2
-  online_filtering: true  # dapo filter groups
-  filter_key: overall
-  filter_low: 0.01
-  filter_high: 0.99
+  # ── 基础 RL 算法 ──────────────────────────────────────────
+  adv_estimator: dapo   # 优势函数估计方式：grpo 或 dapo
+                        # dapo = grpo + 过滤全对/全错的组（见下方 online_filtering）
 
-  use_kl_prcp: true
-  contrastive_type: augmented
-  kl_prcp_penalty: low_var_kl
-  kl_prcp_coef: 1.0e-2
-  kl_prcp_apply_mode: all
-  incorrect_weighting: 0.1
+  # ────────────────────────────────────────────────────────────────────────────
+  # KL 散度约束：两个位置，两个开关，含义完全不同
+  #
+  # 【Actor Loss 是什么】
+  # RL 训练 Actor 的总 Loss = L_PPO_clip + L_KL
+  #   L_PPO_clip：主目标，用 advantage（组内归一化后的 reward）推动模型
+  #               往得分更高的回答方向移动；有 clip 防止更新太激进
+  #   L_KL：约束项，防止模型一次更新太多、偏离初始分布太远（训练崩溃）
+  #
+  # 【两个 KL 开关的区别】
+  # disable_kl: true  → 位置A（reward 层）：不从 token reward 里扣 KL 惩罚
+  #                     即 token_reward = reward_fn 的输出（不减任何 KL 项）
+  # use_kl_loss: true → 位置B（loss 层）：在 L_actor 里额外加一个 KL loss 项
+  #                     即 L_actor = L_clip + kl_coef × KL(当前策略 || 参考策略)
+  #
+  # 当前配置：reward 不扣 KL（disable_kl=true），但 loss 里加 KL（use_kl_loss=true）
+  # 这样 KL 约束存在但不干扰 reward 信号，实验上更稳定
+  # ────────────────────────────────────────────────────────────────────────────
+  disable_kl: true      # true = reward 层不扣 KL（位置A关闭）
+  use_kl_loss: true     # true = loss 层加 KL 约束项（位置B开启）
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # kl_penalty: low_var_kl —— 为什么不用标准 KL？
+  #
+  # 标准 KL = Σ p·log(p/q)，梯度方差大，训练震荡
+  # low_var_kl = (p/q - 1) - log(p/q)，数学期望相同，但方差更小
+  # 直觉：更平滑的梯度信号 → 训练更稳定，不容易因为一个异常样本导致崩溃
+  # 这是现代 RLHF 框架（TRL、VERL 等）的标准做法
+  # ────────────────────────────────────────────────────────────────────────────
+  kl_penalty: low_var_kl  # KL 散度计算方式（low_var_kl 比标准 KL 训练更稳定）
+  kl_coef: 1.0e-2         # KL 损失在 L_actor 中的权重；越大约束越强但学习越慢
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # DAPO 核心：在线过滤无学习信号的样本组
+  #
+  # 【三个参数的联动关系】
+  # filter_key  → 看哪个指标：这里用 "overall"（reward 函数输出的综合分）
+  # filter_low  → 阈值下界：组平均 overall < 0.01 视为"全错"
+  # filter_high → 阈值上界：组平均 overall > 0.99 视为"全对"
+  #
+  # 为什么全对/全错都要丢弃？
+  # 全对：n 个回答 reward 都一样高 → 组内 std ≈ 0 → advantage ≈ 0 → 梯度接近0 → 白算
+  # 全错：同上，n 个回答都一样差，无法分辨谁更好，也没有学习信号
+  # 只有"有对有错"的组才有真实的对比信号，模型才能从中学习
+  # ────────────────────────────────────────────────────────────────────────────
+  online_filtering: true   # DAPO 在线过滤总开关
+  filter_key: overall      # 用 reward 中的 overall 字段作为过滤依据
+  filter_low: 0.01         # 组平均分 < 0.01 → 全错 → 丢弃
+  filter_high: 0.99        # 组平均分 > 0.99 → 全对 → 丢弃
+
+  # ── PAPO 感知增强（核心创新） ─────────────────────────────
+  # 以下参数控制"遮掩图像对比 KL"损失项，即 PAPO 相比 GRPO/DAPO 的差异所在
+  # 总损失 = L_GRPO/DAPO + kl_prcp_coef × KL(原图logits || 遮掩图logits)
+  use_kl_prcp: true         # 总开关：false = 退化为普通 GRPO/DAPO，无 PAPO 特性
+  contrastive_type: augmented  # 对比方式：用遮掩图（augmented）还是其他变换
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # kl_prcp_penalty: low_var_kl —— 感知 KL 也用低方差估计器，原因同上
+  # kl_prcp_coef: 0.01 —— 感知 KL 在总 loss 中的权重
+  #   为什么需要一个独立的权重？
+  #   感知 KL 和 RL reward 的数值量级不同（感知 KL 通常更大），
+  #   需要缩放系数使两者在训练中贡献均衡；太大会压制 reward 信号，太小等于没用
+  # ────────────────────────────────────────────────────────────────────────────
+  kl_prcp_penalty: low_var_kl  # 感知 KL 的计算方式（低方差估计器）
+  kl_prcp_coef: 1.0e-2         # 感知 KL 在总 loss 中的权重（需与 RL reward 量级匹配）
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # kl_prcp_apply_mode: all —— "全部"的含义
+  #   all = 对 batch 内所有样本（无论答对答错）都计算感知 KL 损失
+  #   其他可能的值（框架中未实现）：only_correct（只对答对的）、only_incorrect 等
+  #   用 "all" 的逻辑：视觉感知能力是基础能力，答对答错都需要强化
+  #
+  # incorrect_weighting: 0.1 —— 答错样本的感知 KL 权重降为正常值的 10%
+  #   原因：模型连语义都没理解时，强化视觉感知一致性意义不大；
+  #   权重降低而非归零，保留一点约束防止视觉编码器在错误样本上退化
+  # ────────────────────────────────────────────────────────────────────────────
+  kl_prcp_apply_mode: all      # 对所有样本施加感知 KL（答对答错都算）
+  incorrect_weighting: 0.1     # 答错样本的感知 KL 权重（答对样本权重为 1.0）
+
   aug_config:
-    patch_size: 14
-    black_prob: 0.6
-  kl_prcp_schedule: fixed
+    patch_size: 14    # 遮掩的 patch 尺寸，对齐 Qwen2.5-VL 视觉 token 粒度（14×14像素）
+    black_prob: 0.6   # 每个 patch 被遮掉的概率（60%）
+
+  # 感知 KL 系数随训练进行的变化策略
+  kl_prcp_schedule: fixed      # fixed = 保持不变；也可选 annealing（逐渐衰减）
   kl_prcp_schedule_args:
-    start_value: 1.0e-2
-    end_value: 0.0
-    annealing_ratio: 0.5
-  
-  use_aug_entropy_loss: false
+    start_value: 1.0e-2  # annealing 时的起始值
+    end_value: 0.0       # annealing 时的终止值（训练后期关掉感知 KL）
+    annealing_ratio: 0.5 # 在训练前 50% 时间内完成从 start 到 end 的线性衰减
+
+  # ── 可选的熵正则化项 ──────────────────────────────────────
+  # 熵损失鼓励模型输出分布更均匀（探索性更强），防止策略过早坍缩到单一模式
+  # 坍缩：模型每次都输出同一种格式/答案，不再探索其他可能性
+  use_aug_entropy_loss: false    # 对遮掩图的输出施加熵正则（当前关闭）
   aug_entropy_loss_coef: 0.03
-  
-  use_ori_entropy_loss: false
+
+  use_ori_entropy_loss: false    # 对原图的输出施加熵正则（当前关闭）
   ori_entropy_loss_coef: 0.03
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 【Worker 配置】
+#
+# 框架中有 3 个逻辑模型，通过 CPU offload 错峰使用 GPU 显存：
+#
+#   Actor (FSDP)     ← 训练时用 GPU；rollout 时参数卸到 CPU
+#   Rollout (vLLM)   ← 推理时用 GPU（最多60%）；update 时释放
+#   Reference (FSDP) ← 参数不更新，常驻 CPU，需要时临时上 GPU
+#
+# 时序：rollout → reward → [actor 从CPU加载] → update → [同步权重给vLLM] → rollout...
+# ──────────────────────────────────────────────────────────────────────────────
 worker:
+  # ── Actor Worker：负责模型参数更新 ───────────────────────
   actor:
-    global_batch_size: 128  # equivalent to verl's actor.ppo_mini_batch_size
-    micro_batch_size_per_device_for_update: 4  # equivalent to verl's actor.ppo_micro_batch_size_per_gpu
-    micro_batch_size_per_device_for_experience: 16  # equivalent to verl's rollout.log_prob_micro_batch_size_per_gpu
-    max_grad_norm: 1.0
-    padding_free: true
-    ulysses_size: 1
+    # ────────────────────────────────────────────────────────────────────────
+    # global_batch_size: 128
+    # 每次参数更新（一个 gradient step）使用多少条序列。
+    # 类比监督学习的 batch_size，但这里的"样本"是模型自己生成的回答。
+    # rollout 会生成 512 个 prompt × n=5 = 2560 条序列；
+    # 参数更新时每次取 128 条做一次 gradient step（循环多次直到用完所有序列）
+    #
+    # micro_batch_size_per_device_for_update: 4
+    # 梯度累积的单位。例如 8 张卡，每卡负责 128/8=16 条序列，
+    # 但显存不够一次放 16 条，所以分 4 条一组跑 4 次，累积梯度后再更新。
+    # 减小此值 = 省显存；增大此值 = 更快（但需要更多显存）
+    #
+    # micro_batch_size_per_device_for_experience: 16
+    # 重新计算 log_prob 时的 batch 大小（"experience" = rollout 生成的数据）。
+    # 这个计算不需要梯度（只是 forward），显存占用更小，所以可以设更大值（16 > 4）
+    # ────────────────────────────────────────────────────────────────────────
+    global_batch_size: 128         # 每次参数更新使用的序列总数（PPO mini-batch）
+    micro_batch_size_per_device_for_update: 4      # 单卡反向传播的 micro-batch（梯度累积单位）
+    micro_batch_size_per_device_for_experience: 16 # 单卡重算 log_prob 的 micro-batch（无梯度，可更大）
+    max_grad_norm: 1.0             # 梯度裁剪阈值，防止梯度爆炸导致训练崩溃
+
+    # ────────────────────────────────────────────────────────────────────────
+    # padding_free: true
+    # 通常 batch 内所有序列必须 pad 到相同长度（最长那条），
+    # 短序列的 pad token 浪费计算和显存。
+    # padding_free=true 使用 flash-attn 的 varlen（可变长度）模式，
+    # 把多条序列拼接成一条长序列，用 cu_seqlens 标记每条序列的边界，
+    # attention 只在各自序列内计算，不跨序列。
+    # 效果：省显存 + 省计算（特别是序列长度差异大时）
+    #
+    # ulysses_size: 1
+    # 序列并行（Ulysses 策略）：把一条超长序列切分到多张卡上并行处理。
+    # 适用场景：单条序列长度超过单卡显存上限（如 100K+ token 的长文档）。
+    # 本项目序列不超长，设 1 = 不开序列并行。
+    # ────────────────────────────────────────────────────────────────────────
+    padding_free: true             # 变长 attention，不 pad 到最长，省显存
+    ulysses_size: 1                # 序列并行大小，1 = 关闭（序列不够长不需要）
+
     model:
-      model_path: Qwen/Qwen2.5-3B-Instruct
-      enable_gradient_checkpointing: true
-      trust_remote_code: true
-      freeze_vision_tower: false
+      model_path: Qwen/Qwen2.5-3B-Instruct  # 初始权重路径（本项目用 Lingshu-7B）
+      enable_gradient_checkpointing: true    # 以重算换显存：前向不保留所有激活值
+      trust_remote_code: true               # 加载自定义模型代码（Qwen2.5-VL 需要）
+      # ────────────────────────────────────────────────────────────────────
+      # freeze_vision_tower: false
+      # Vision Tower = 视觉编码器（ViT 部分），负责把图像像素转成 token 特征。
+      # false = 视觉编码器也参与 RL 训练，权重会被更新
+      #   → 模型可以学到更适合医学图像定位的视觉特征
+      # true  = 视觉编码器冻结，只训练语言头（LM head）
+      #   → 省显存，但视觉理解能力无法提升
+      # 本项目开启视觉编码器训练，这是 PAPO 能改善视觉感知的基础
+      # ────────────────────────────────────────────────────────────────────
+      freeze_vision_tower: false            # false = 视觉编码器参与训练（PAPO 需要）
+
     optim:
-      lr: 1.0e-6
-      weight_decay: 1.0e-2
-      strategy: adamw_bf16
-      lr_warmup_ratio: 0.0
+      # ────────────────────────────────────────────────────────────────────
+      # lr: 1e-6 —— 为什么 RL 微调用这么小的学习率？
+      # 预训练模型已经具备很强的能力；RL 微调的目标是"微调方向"而非"重新学习"。
+      # 学习率过大会破坏预训练能力（灾难遗忘），导致模型虽然在任务上得分高，
+      # 但通用语言能力退化。1e-6 是 RL 微调的经验安全值。
+      #
+      # weight_decay: 1e-2 —— L2 正则化（这里指优化器中的 weight decay，非独立正则化项）
+      # 每次更新时，参数向 0 略微收缩，防止个别参数过大（过拟合）。
+      # AdamW 的 weight_decay 和 L2 正则化等价，是标准做法。
+      # ────────────────────────────────────────────────────────────────────
+      lr: 1.0e-6           # 学习率（极小，防止破坏预训练能力）
+      weight_decay: 1.0e-2 # AdamW 的权重衰减（等价 L2 正则化，防过拟合）
+      strategy: adamw_bf16 # AdamW 优化器 + bf16 精度（节省显存且数值稳定）
+      lr_warmup_ratio: 0.0 # 学习率预热比例，0 = 直接用目标 lr 无预热
+
     fsdp:
-      torch_dtype: bf16 # here: for bf16
-      enable_full_shard: true
-      enable_cpu_offload: false
-      enable_rank0_init: true
+      # ────────────────────────────────────────────────────────────────────
+      # FSDP（Fully Sharded Data Parallel）：把模型参数、梯度、优化器状态
+      # 均匀切分到所有 GPU 上，每张卡只保存 1/N 的数据，解决单卡显存不足问题。
+      #
+      # torch_dtype: bf16 —— 训练精度
+      # bf16 比 fp16 数值范围更大（指数位更多），不容易因为梯度溢出崩溃；
+      # 比 fp32 省一半显存。是目前大模型训练的标准精度。
+      #
+      # enable_full_shard: true —— 全分片模式
+      # 参数 + 梯度 + 优化器状态三者全部分片。显存占用最小，但通信量最大。
+      #
+      # enable_rank0_init: true —— Rank0 初始化
+      # 先在 GPU 0 上加载完整模型权重，再切分广播给其他 GPU。
+      # 好处：避免每张卡都独立从磁盘读权重（慢且占 CPU 内存）
+      # 代价：GPU 0 需要短暂容纳完整模型（需要足够显存）
+      # ────────────────────────────────────────────────────────────────────
+      torch_dtype: bf16          # 训练精度（bf16：数值稳定，省显存）
+      enable_full_shard: true    # 参数+梯度+优化器状态全部分片到各卡
+      enable_cpu_offload: false  # 优化器状态留在 GPU（更快，但占更多显存）
+      enable_rank0_init: true    # 先在 rank0 加载完整权重再分片广播
+
+    # ────────────────────────────────────────────────────────────────────────
+    # offload：Actor 和 vLLM 如何共享同一批 GPU 显存
+    #
+    # vLLM 推理（rollout）和 FSDP 更新（update）不同时运行，而是交替：
+    #   rollout 时：offload_params=true → actor 参数卸到 CPU，腾出 GPU 给 vLLM
+    #   update 时：vLLM 引擎暂停，actor 参数从 CPU 重新加载到 GPU 做反向传播
+    #
+    # 代价：每个 step 多一次 CPU↔GPU 数据搬运（约几秒）
+    # 好处：在有限显存的单节点上实现 vLLM 推理 + FSDP 训练
+    # ────────────────────────────────────────────────────────────────────────
     offload:
-      offload_params: true  # true: more CPU memory; false: more GPU memory
-      offload_optimizer: true  # true: more CPU memory; false: more GPU memory
+      offload_params: true      # rollout 时把 actor 参数卸到 CPU（腾显存给 vLLM）
+      offload_optimizer: true   # rollout 时把优化器状态也卸到 CPU
 
+  # ── Rollout Worker：负责用 vLLM 生成回答 ─────────────────
+  # ────────────────────────────────────────────────────────────────────────────
+  # 为什么 GRPO 需要 vLLM？
+  # GRPO 需要对每个 prompt 生成 n=5 个独立回答，自回归解码极慢（逐 token 生成）。
+  # vLLM 通过 PagedAttention + KV Cache 复用，生成速度比纯 PyTorch 快 3-10x。
+  # 生成这 5 个回答是整个训练 step 中最耗时的环节，vLLM 是性能关键。
+  # ────────────────────────────────────────────────────────────────────────────
   rollout:
-    n: 5
-    temperature: 1.0
-    top_p: 0.99
-    limit_images: 0
-    gpu_memory_utilization: 0.6
-    enforce_eager: false
-    enable_chunked_prefill: false
-    tensor_parallel_size: 2
-    disable_tqdm: false
-    val_override_config:
-      temperature: 1.0
-      n: 8
+    n: 5               # GRPO 组大小：每个 prompt 生成几个独立回答用于组内对比
+                       # n 越大对比信号越丰富，但显存和时间线性增加
+    temperature: 1.0   # 生成温度，1.0 = 保持原始概率分布（完整探索，不过于贪心）
+    top_p: 0.99        # nucleus sampling：只从累计概率前 99% 的 token 中采样
+                       # 过滤掉极小概率的奇怪 token，但保留足够的多样性
 
+    # ────────────────────────────────────────────────────────────────────────
+    # limit_images: 0
+    # 这是本项目特有的参数（医学多图场景）：限制每个样本最多使用几张图。
+    # 0 = 不限制，使用 JSONL 中该样本的所有图像。
+    # 设为 1 可强制模型只看单张图（减显存，但忽略多图信息）。
+    # ────────────────────────────────────────────────────────────────────────
+    limit_images: 0    # 单样本最多使用几张图，0 = 不限制
+
+    # ────────────────────────────────────────────────────────────────────────
+    # gpu_memory_utilization: 0.6
+    # vLLM 最多使用 60% 的 GPU 显存。
+    # 剩余 40% 预留给：actor 参数从 CPU 加载时的临时显存、FSDP 通信缓冲等。
+    # 如果训练时出现显存 OOM，可尝试降低这个值（如 0.5）
+    # ────────────────────────────────────────────────────────────────────────
+    gpu_memory_utilization: 0.6  # vLLM 可用 GPU 显存比例（剩余留给 actor 切换）
+
+    # ────────────────────────────────────────────────────────────────────────
+    # enforce_eager: false
+    # vLLM 默认使用 CUDA Graph：预先编译计算图，推理更快，但初始化慢、内存固定。
+    # false = 启用 CUDA Graph（生产环境推荐）
+    # true  = 禁用 CUDA Graph，用 PyTorch eager 模式（调试时用，速度慢但更灵活）
+    #
+    # enable_chunked_prefill: false
+    # Chunked Prefill：把超长 prompt 的 prefill（编码）过程分块处理，
+    # 避免一次性处理超长 prompt 时显存溢出。
+    # false = 不分块（prompt 长度在限制内时不需要）
+    # ────────────────────────────────────────────────────────────────────────
+    enforce_eager: false         # false = 启用 CUDA Graph（推理更快）
+    enable_chunked_prefill: false  # 超长 prompt 分块 prefill（本项目 prompt 长度可控，关闭）
+    tensor_parallel_size: 2      # vLLM 内部张量并行（2 = 模型权重切分到2张卡）
+    disable_tqdm: false          # 显示生成进度条
+
+    val_override_config:
+      temperature: 1.0  # 验证时的生成温度
+      n: 8              # 验证时生成 8 个回答（比训练多，评估 reward 更准）
+
+  # ── Reference Policy Worker：KL 散度的参考基准 ───────────
+  # ────────────────────────────────────────────────────────────────────────────
+  # Reference Policy 是什么？
+  # = 训练开始时的初始模型（Lingshu-7B 原始权重），参数永远不更新。
+  # 作用：提供 KL 散度计算的基准分布，限制当前策略不能偏离初始分布太远。
+  # 当 disable_kl=true 时，它的 log_prob 不参与 reward 计算，
+  # 但 use_kl_loss=true 时，它的 log_prob 仍用于 actor loss 中的 KL 项。
+  #
+  # 显存策略：enable_cpu_offload=true，参考策略常驻 CPU，
+  # 只在需要计算 ref_log_probs 时临时上 GPU，用完立刻卸回 CPU。
+  # ────────────────────────────────────────────────────────────────────────────
   ref:
     fsdp:
-      torch_dtype: bf16 # here: for bf16
+      torch_dtype: bf16
       enable_full_shard: true
-      enable_cpu_offload: true  # true: more CPU memory; false: more GPU memory
+      enable_cpu_offload: true   # 参考策略常驻 CPU，只在计算 KL 时临时上 GPU
       enable_rank0_init: true
     offload:
       offload_params: false
 
+  # ── Reward Worker：对模型回答打分 ────────────────────────
+  # ────────────────────────────────────────────────────────────────────────────
+  # Reward Worker 是什么？
+  # 一个独立的 Ray worker 进程（CPU 上运行），接收模型生成的文本，
+  # 调用 reward_function 计算分数，返回给 trainer。
+  # 它不参与梯度计算，只做规则判断（IoU、格式解析等）。
+  #
+  # 插件式设计：只需改 reward_function 路径即可切换任务。
+  # ────────────────────────────────────────────────────────────────────────────
   reward:
-    reward_type: batch
+    reward_type: batch  # batch 模式：一次性给整个 batch 打分（比逐条更高效）
     reward_function: examples/reward_function/math.py:compute_score
+    # 医学证据定位任务改为：
+    # reward_function: examples/reward_function/medical_evidence.py:compute_score
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 【Trainer 配置】
+# 控制训练节奏：跑多久、多久验证/保存、用什么日志工具
+# ──────────────────────────────────────────────────────────────────────────────
 trainer:
-  total_epochs: 15
-  max_steps: null
-  project_name: easy_r1
-  experiment_name: qwen2_5_3b_math_grpo
-  logger: ["console", "wandb"]
-  nnodes: 1
-  n_gpus_per_node: 8
-  max_try_make_batch: 20  # -1 means no limit
-  val_freq: 5  # -1 to disable
-  val_before_train: true
-  val_only: false
-  val_generations_to_log: 3
-  save_freq: 5  # -1 to disable
-  save_limit: 3  # -1 to disable
-  save_model_only: false
-  save_checkpoint_path: null
-  load_checkpoint_path: null
-  save_best_checkpoint: true
+  total_epochs: 15    # 训练总轮数（遍历完整训练集的次数）
+  max_steps: null     # 最大步数上限，null = 只用 epochs 控制（两者取先到的那个）
+
+  project_name: easy_r1              # 实验项目名（wandb/tensorboard 中的分组名）
+  experiment_name: qwen2_5_3b_math_grpo  # 具体实验名（checkpoint 目录名也用这个）
+
+  logger: ["console", "wandb"]  # 日志后端；集群无 wandb 时改为 ["console", "tensorboard"]
+
+  nnodes: 1           # 使用几个计算节点（单节点训练用1）
+  n_gpus_per_node: 8  # 每个节点的 GPU 数量（本项目集群节点有4张H200）
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # max_try_make_batch: 20
+  # DAPO 的在线过滤会丢弃全对/全错的组，过滤后剩余样本可能不足 rollout_batch_size。
+  # 不足时循环继续取数据补充，最多尝试 20 次。
+  # 如果尝试 20 次还凑不齐，说明数据集中有效样本太少（或过滤阈值太严），报错提示。
+  # -1 = 不限制尝试次数（谨慎使用，可能无限循环）
+  # ────────────────────────────────────────────────────────────────────────────
+  max_try_make_batch: 20  # DAPO 过滤后补充样本的最大尝试次数
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # val_freq: 5
+  # 每隔多少个训练 step 做一次验证（在 val_files 上评估 reward）。
+  # val_before_train=true：训练开始前也做一次验证，记录初始基准性能（step=0）。
+  # 注意：一个 step = 处理一个 rollout_batch（512 个 prompt）
+  # ────────────────────────────────────────────────────────────────────────────
+  val_freq: 5         # 每 5 个训练 step 做一次验证；-1 = 不做验证
+  val_before_train: true  # 训练前先验证一次，记录 step=0 的基准性能
+  val_only: false     # true = 只验证不训练（纯推理评测模式）
+  val_generations_to_log: 3  # 每次验证记录几个样本的生成文本（定性分析用）
+
+  save_freq: 5        # 每 5 步保存一次 checkpoint；-1 = 不保存
+  save_limit: 3       # 最多保留几个历史 checkpoint（超出后删最旧的，节省磁盘）
+  save_model_only: false  # true = 只保存模型权重（不保存优化器状态，无法续训但省空间）
+  save_checkpoint_path: null   # 指定保存路径；null = 自动用 experiment_name 生成路径
+  load_checkpoint_path: null   # 从哪个 checkpoint 恢复训练；null = 从头训练
+  save_best_checkpoint: true   # 同时保存验证集 reward 最高的 checkpoint

@@ -163,6 +163,25 @@ def compute_gae_advantage_return(
     return advantages, returns
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# GRPO（Group Relative Policy Optimization）优势函数计算
+#
+# 【核心思想】
+# 传统 PPO 需要一个 Critic（价值网络）来估计"当前状态值多少分"，
+# 然后用 (实际得分 - 估计值) 作为 advantage。这需要额外训练一个 Critic 模型。
+#
+# GRPO 的做法：直接用同一个 prompt 的多个回答互相比较（组内对比）。
+# 对同一 prompt 生成 n=5 个回答，各自得到 reward，然后：
+#   advantage[i] = (reward[i] - 组内平均) / 组内标准差
+#
+# 这样就不需要 Critic，节省了一整个模型的显存和计算。
+# 代价是每个 prompt 需要生成多个回答（n≥2），rollout 成本更高。
+#
+# 【index 参数的作用】
+# batch 中有多个 prompt，每个 prompt 生成了 n 个回答，
+# index 记录每个回答属于哪个 prompt（同一 prompt 的 n 个回答有相同 index），
+# 用于把正确的回答分到正确的"组"里做组内对比。
+# ──────────────────────────────────────────────────────────────────────────────
 # NOTE(sgm): this implementation only consider outcome supervision, where the reward is a scalar.
 @torch.no_grad()
 def compute_grpo_outcome_advantage(
@@ -189,25 +208,48 @@ def compute_grpo_outcome_advantage(
             shape: (bs, response_length)
 
     """
+    # 每个回答的 token-level reward 求和 → 得到整条回答的标量得分
+    # 这是"outcome supervision"：只看最终结果的分数，不区分哪个 token 好哪个差
     scores = token_level_rewards.sum(dim=-1)
     id2score = defaultdict(list)
     id2mean, id2std = {}, {}
 
     bsz = scores.shape[0]
     for i in range(bsz):
+        # 按 prompt index 分组：同一个 prompt 的 n 个回答放在一起
         id2score[index[i]].append(scores[i])
 
     for idx in id2score:
         assert len(id2score[idx]) > 1, "GRPO needs rollout.n > 1."
+        # 计算组内均值和标准差，用于后续归一化
         id2mean[idx] = torch.mean(torch.tensor(id2score[idx]))
         id2std[idx] = torch.std(torch.tensor(id2score[idx]))
 
     for i in range(bsz):
+        # 组内归一化：分数 → advantage（均值为0，标准差为1）
+        # 直觉：不同 prompt 的绝对分数难以比较，但同一 prompt 内"谁更好"是有意义的
         scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + eps)
 
+    # advantage 广播到 token 维度：每个 token 的 advantage = 整条回答的 advantage
+    # response_mask 遮掉 pad token（pad token 不参与梯度）
     returns = scores.unsqueeze(-1) * response_mask
     return returns, returns
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DAPO（Dynamic Sampling Policy Optimization）优势函数计算
+#
+# 【与 GRPO 的唯一区别】
+# DAPO 在 ray_trainer.py 的 _make_batch_data() 中已经过滤掉了"全对/全错"的组，
+# 到这里的 batch 理论上已经是"有对有错"的有效组了。
+# 所以 compute_dapo_outcome_advantage 的计算逻辑和 GRPO 完全相同——
+# 差异在于上游的数据过滤，而不在这里的计算。
+#
+# 【为什么全对/全错的组没有学习信号？】
+# 全对：组内所有回答 reward 相同 → std ≈ 0 → advantage ≈ 0 → 梯度接近0 → 白算
+# 全错：同上，所有回答都一样差，也无法分辨哪个更好
+# DAPO 跳过这些组，把算力集中在真正能产生学习信号的样本上。
+# ──────────────────────────────────────────────────────────────────────────────
 # NOTE(sgm): this implementation only consider outcome supervision, where the reward is a scalar.
 @torch.no_grad()
 def compute_dapo_outcome_advantage(
@@ -253,6 +295,28 @@ def compute_dapo_outcome_advantage(
     returns = scores.unsqueeze(-1) * response_mask
     return returns, returns
 
+# ──────────────────────────────────────────────────────────────────────────────
+# PRPO（Perception-Reward Policy Optimization）优势函数计算
+#
+# 【与 GRPO/DAPO 的区别】
+# GRPO/DAPO 只有一个标量 reward（outcome reward，即"最终答案对不对"）。
+# PRPO 在此之上引入第二路 reward：stage2_rewards（感知/中间阶段奖励）。
+# 典型场景：医学证据定位任务里，stage2 可以是 bounding box 的 IoU 得分，
+# 用来奖励"模型看对了图像区域"，而不仅仅是"最终答案碰巧对了"。
+#
+# 【两路 reward 如何融合】
+#   scores = outcome_reward + stage2_alpha * stage2_reward
+# stage2_alpha 控制感知奖励的权重（默认 0.5）：
+#   过大 → 模型只顾对齐感知目标，忽略最终答案正确性；
+#   过小 → stage2 信号被淹没，退化回普通 GRPO。
+# 融合后的 scores 再走和 GRPO 完全相同的组内归一化流程。
+#
+# 【为什么有用】
+# 单纯 outcome reward 容易出现"答案对但理由错"（蒙对）。
+# 加入感知奖励后，模型被同时约束在"看对地方 + 答对问题"两个维度上，
+# 减少捷径学习，提升推理的可解释性和泛化性。
+# stage2_rewards 为 None 时自动退化为标准 GRPO。
+# ──────────────────────────────────────────────────────────────────────────────
 # NOTE(sgm): this implementation only consider outcome supervision, where the reward is a scalar.
 @torch.no_grad()
 def compute_prpo_outcome_advantage(
@@ -280,26 +344,32 @@ def compute_prpo_outcome_advantage(
             shape: (bs, response_length)
 
     """
+    # 两路 reward 融合：outcome（最终答案）+ 加权感知奖励（stage2）
+    # stage2_rewards 为 None 时退化为标准 GRPO（只用 outcome reward）
     if stage2_rewards is not None:
         scores = token_level_rewards.sum(dim=-1) + stage2_alpha * stage2_rewards.sum(dim=-1)
     else:
         scores = token_level_rewards.sum(dim=-1)
-    
+
     id2score = defaultdict(list)
     id2mean, id2std = {}, {}
 
+    # 按 prompt index 把同一 prompt 的 n 个回答分到同一组
     bsz = scores.shape[0]
     for i in range(bsz):
         id2score[index[i]].append(scores[i])
 
+    # 每组算均值/标准差，用于组内归一化
     for idx in id2score:
         assert len(id2score[idx]) > 1, "GRPO needs rollout.n > 1."
         id2mean[idx] = torch.mean(torch.tensor(id2score[idx]))
         id2std[idx] = torch.std(torch.tensor(id2score[idx]))
 
+    # 组内归一化：融合后的 score → advantage（与 GRPO 同一套逻辑）
     for i in range(bsz):
         scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + eps)
 
+    # advantage 广播到 token 维度，response_mask 遮掉 pad token
     returns = scores.unsqueeze(-1) * response_mask
     return returns, returns
 

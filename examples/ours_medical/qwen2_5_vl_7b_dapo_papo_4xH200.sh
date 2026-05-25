@@ -99,6 +99,7 @@ GLOBAL_BATCH_SIZE=128
 ROLLOUT_BATCH_SIZE=384
 MINI_ROLLOUT_BATCH_SIZE=128
 MAX_PROMPT_LENGTH=4096
+MAX_TRY_MAKE_BATCH=50
 
 # ── 9. PAPO Parameters ───────────────────────────────────────────────
 KL_PRCP_COEF=0.01
@@ -111,6 +112,16 @@ ORI_ENTROPY_LOSS_COEF=0.03
 # ── 10. Experiment Name ──────────────────────────────────────────────
 EXP_NAME="medical_evidence__dapo_papo__7b__ep${TOTAL_EPOCHES}_rb${ROLLOUT_BATCH_SIZE}_gb${GLOBAL_BATCH_SIZE}"
 
+# ── 11. Resume checkpoint (set to null to train from scratch) ─────────
+LOAD_CHECKPOINT_PATH=null
+
+# ── 12. Log file (saved alongside checkpoints) ───────────────────────
+CKPT_BASE="checkpoints/easy_r1/${EXP_NAME}"
+mkdir -p "${CKPT_BASE}"
+RUN_TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+LOG_FILE="${CKPT_BASE}/training_${RUN_TIMESTAMP}.log"
+echo "Log file: ${LOG_FILE}"
+
 echo ""
 echo "=========================================="
 echo "  Experiment: ${EXP_NAME}"
@@ -118,11 +129,12 @@ echo "  Algorithm:  DAPO + PAPO"
 echo "  GPUs:       ${N_GPU} × H200"
 echo "  Epochs:     ${TOTAL_EPOCHES}"
 echo "  Save every: ${SAVE_FREQ} steps"
+echo "  Log:        ${LOG_FILE}"
 echo "=========================================="
 echo ""
 
 
-# ── 11. Launch Training ──────────────────────────────────────────────
+# ── 13. Launch Training ──────────────────────────────────────────────
 CUDA_VISIBLE_DEVICES=${CUDA_IDS} python3 -m verl.trainer.main \
     config=${CONFIG_FILE} \
     data.train_files=${TRAIN_FILE} \
@@ -154,5 +166,8 @@ CUDA_VISIBLE_DEVICES=${CUDA_IDS} python3 -m verl.trainer.main \
     trainer.save_freq=${SAVE_FREQ} \
     trainer.save_limit=${SAVE_LIMIT} \
     trainer.val_freq=${VAL_FREQ} \
+    trainer.max_try_make_batch=${MAX_TRY_MAKE_BATCH} \
+    trainer.load_checkpoint_path=${LOAD_CHECKPOINT_PATH} \
     trainer.save_best_checkpoint=true \
-    worker.reward.reward_function=${REWARD_FUNCTION}
+    worker.reward.reward_function=${REWARD_FUNCTION} \
+    2>&1 | tee "${LOG_FILE}"

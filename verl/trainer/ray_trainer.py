@@ -665,28 +665,51 @@ class RayPPOTrainer:
                     for uid, avg_score in uid2mean.items()
                     if avg_score > self.config.algorithm.filter_low and avg_score < self.config.algorithm.filter_high
                 ]
+                raw_size = len(uid2mean)
                 kept_sample_idxs = [idx for idx, uid in enumerate(uids) if uid in kept_uids]
                 if len(kept_sample_idxs) == 0:
                     kept_sample_idxs = list(range(len(uids)))
                 new_batch = new_batch[kept_sample_idxs]
+                kept_size = len(kept_uids) if len(kept_uids) > 0 else raw_size
+                filter_rate = kept_size / raw_size if raw_size > 0 else 0.0
+                print(
+                    f"[batch_collect] attempt={num_try_make_batch} "
+                    f"raw={raw_size} kept={kept_size} pass_rate={filter_rate:.1%}"
+                )
+            else:
+                raw_size = len(new_batch) // self.config.worker.rollout.n
+                print(f"[batch_collect] attempt={num_try_make_batch} raw={raw_size} kept={raw_size} (no filter)")
 
             batch = DataProto.concat([batch, new_batch]) if batch is not None else new_batch
             current_batch_size = len(batch) // self.config.worker.rollout.n
             rollout_batch_size = self.config.data.rollout_batch_size
+            print(
+                f"[batch_collect] cumulative={current_batch_size}/{rollout_batch_size} prompts"
+            )
             if current_batch_size < rollout_batch_size:
                 if len(batch) == 0:
                     print("Warning: Generated batch is empty, continuing to generate more data...")
                     continue
-                print(f"{current_batch_size=} < {rollout_batch_size=}")
                 max_try_make_batch = self.config.trainer.max_try_make_batch
                 if max_try_make_batch <= 0 or num_try_make_batch < max_try_make_batch:
-                    print(f"{num_try_make_batch=}. Continue generating...")
+                    print(f"[batch_collect] attempt={num_try_make_batch}. Continue generating...")
                 else:
+                    min_size = int(rollout_batch_size * self.config.trainer.min_batch_ratio)
+                    if self.config.trainer.allow_partial_batch and current_batch_size >= min_size:
+                        print(
+                            f"[batch_collect] WARNING: partial batch {current_batch_size}/{rollout_batch_size} "
+                            f"after {num_try_make_batch} attempts (>= min={min_size}). Continuing with partial batch."
+                        )
+                        if self.config.algorithm.online_filtering:
+                            metrics.update({f"reward/{k}": v for k, v in reduce_metrics(all_metrics).items()})
+                        return batch[: current_batch_size * self.config.worker.rollout.n]
                     raise ValueError(
-                        f"{num_try_make_batch=} >= {max_try_make_batch=}. Generated too many. Please check your data."
+                        f"{num_try_make_batch=} >= {max_try_make_batch=} and "
+                        f"partial batch {current_batch_size} < min={min_size}. "
+                        f"Check data or lower filter_high/raise rollout_batch_size."
                     )
             else:
-                print(f"{current_batch_size=} >= {rollout_batch_size=}. Finish generating.")
+                print(f"[batch_collect] {current_batch_size=} >= {rollout_batch_size=}. Done.")
                 if self.config.algorithm.online_filtering:
                     metrics.update({f"reward/{k}": v for k, v in reduce_metrics(all_metrics).items()})
 

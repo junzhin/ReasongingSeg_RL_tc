@@ -154,6 +154,10 @@ class TrainerConfig:
     """number of gpus per node for training"""
     max_try_make_batch: int = 20
     """max number of generations for online filtering, -1 means no limit"""
+    allow_partial_batch: bool = True
+    """after max_try_make_batch, use partial batch if >= min_batch_ratio of rollout_batch_size"""
+    min_batch_ratio: float = 0.5
+    """minimum fraction of rollout_batch_size accepted as partial batch"""
     critic_warmup: int = 0
     """critic warmup steps"""
     val_freq: int = -1
